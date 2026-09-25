@@ -1,0 +1,10 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Browser profile, if anyone points --profile-dir inside the repo.
+*-profile/
+
+# Local configuration.
+add-send-as.sh
