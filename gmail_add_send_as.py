@@ -18,9 +18,23 @@ field names, so hidden fields (at, cfrp, ...) are always correct.
 Authentication: the script launches Chrome as a normal, non-automated
 browser with a DEDICATED profile folder and attaches over the DevTools protocol.
 The first run, you sign in by hand (incl. 2-step verification); later runs reuse
-that session. Keep the profile folder private - it holds a live Google session.
-Running over SSH works too; see launch_browser() for the macOS keychain detail
-that makes the saved session survive.
+that session. Running over SSH works too; see launch_browser() for the macOS
+keychain detail that makes the saved session survive.
+
+That saved session is the sharp edge here. A Google cookie cannot be scoped -
+there is no Gmail-only session, so the profile is full access to the account,
+and Google offers nothing narrower for a personal account (the Gmail API can add
+a send-as alias, but only for service accounts with domain-wide delegation,
+which consumer accounts cannot have). Since the permission cannot be reduced,
+this script reduces exposure instead:
+
+  * --profile-image keeps the profile inside an encrypted sparsebundle that is
+    mounted for the run and detached after, so it is ciphertext at rest. The
+    passphrase must come from off this machine to be worth anything.
+  * --port defaults to 0, so the DevTools port - which is unauthenticated for as
+    long as it is open - is random rather than a documented number.
+  * Teardown always ends by confirming no Chrome is left on the profile, and a
+    dropped SSH connection unwinds through it rather than orphaning the browser.
 
 Requirements:
     pip install playwright       # no need for `playwright install`; we use your browser
@@ -33,10 +47,11 @@ Example:
 
 import argparse
 import getpass
-import json
 import os
 import platform
 import re
+import select
+import signal
 import subprocess
 import sys
 import time
@@ -44,6 +59,9 @@ import urllib.parse
 import urllib.request
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+from profile_volume import (MountError, detach, end_profile_processes, is_mounted,
+                            mount, profile_pids)
 
 MAIL = "https://mail.google.com"
 
@@ -86,10 +104,57 @@ def macos_app_bundle(exe):
     return exe[:exe.index(".app") + 4] if marker in exe else None
 
 
+def devtools_port(profile_dir, deadline):
+    """Chrome writes the port it actually bound on line 1 of DevToolsActivePort.
+    Returns it once it answers, else None. Needed because we ask for port 0."""
+    path = os.path.join(profile_dir, "DevToolsActivePort")
+    while time.time() < deadline:
+        try:
+            with open(path) as fh:
+                first = fh.readline().strip()
+        except OSError:
+            first = ""
+        if first.isdigit():
+            port = int(first)
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/json/version", timeout=1):
+                    return port
+            except OSError:
+                pass
+        time.sleep(0.5)
+    return None
+
+
 def launch_browser(exe, profile_dir, port):
-    """Start the browser and wait for its DevTools port. Returns a Popen, or None
-    when macOS launched it for us (see below) and there is no child to hold on to."""
+    """Start the browser and wait for its DevTools port. Returns (proc, port).
+    proc is None when macOS launched it for us (see below), or when we adopted an
+    instance that was already running, and there is no child to hold on to.
+
+    port=0 (the default) asks Chrome for an ephemeral port instead of a published
+    one. The DevTools port is unauthenticated: anything that can open a local
+    socket can drive a signed-in browser through it, so it should not sit on a
+    number that is written down in --help."""
     os.makedirs(profile_dir, exist_ok=True)
+
+    # A previous run may have left Chrome up holding a live Google session. Two
+    # Chromes cannot share a profile - the second silently defers to the first -
+    # so without this we would attach to whatever was already there and never say
+    # so. Adopt it when it is healthy, clear it out when it is not.
+    if profile_pids(profile_dir):
+        found = devtools_port(profile_dir, time.time() + 5)
+        if found:
+            log(f"Adopting the browser already running on this profile (port {found}).")
+            return None, found
+        log("Stale browser on this profile with no usable DevTools port; closing it.")
+        end_profile_processes(profile_dir)
+
+    # Chrome rewrites this only at startup; a leftover would name a dead port.
+    try:
+        os.remove(os.path.join(profile_dir, "DevToolsActivePort"))
+    except OSError:
+        pass
+
     flags = [f"--remote-debugging-port={port}", f"--user-data-dir={profile_dir}",
              "--no-first-run", "--no-default-browser-check", "about:blank"]
 
@@ -110,43 +175,65 @@ def launch_browser(exe, profile_dir, port):
         proc = subprocess.Popen([exe] + flags,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    for _ in range(60):
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1):
-                return proc
-        except OSError:
-            time.sleep(0.5)
-    stop_browser(None, proc, profile_dir, port)
-    sys.exit("Browser did not expose the DevTools port. Is another instance using this profile?")
+    bound = devtools_port(profile_dir, time.time() + 30)
+    if bound is None:
+        stop_browser(None, proc, profile_dir, None)
+        sys.exit("Browser did not expose a DevTools port. "
+                 "Is another instance using this profile?")
+    return proc, bound
 
 
 def stop_browser(browser, proc, profile_dir, port):
     """Shut the browser down *gracefully*. This matters: Chrome only commits its
     cookie store to disk on a batched timer (tens of seconds) or during a clean
     shutdown, so killing it outright right after signing in throws the session
-    away. Browser.close runs the real shutdown path and flushes."""
+    away. Browser.close runs the real shutdown path and flushes.
+
+    Always finishes with end_profile_processes: a graceful close that quietly
+    fails used to leave a signed-in Chrome, and its unauthenticated DevTools
+    port, running indefinitely."""
     if browser is not None:
         try:
             browser.new_browser_cdp_session().send("Browser.close")
         except Exception:
             pass
-    for _ in range(60):                      # wait for the port to go away
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1):
-                time.sleep(0.5)
-        except OSError:
-            break
-    else:                                    # still up: fall back to signalling it
-        if proc is not None:
-            proc.terminate()
-        else:
-            subprocess.run(["pkill", "-f", f"--user-data-dir={profile_dir}"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if port is not None:
+        for _ in range(60):                  # wait for the port to go away
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/json/version", timeout=1):
+                    time.sleep(0.5)
+            except OSError:
+                break
     if proc is not None:
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            proc.terminate()
+    if not end_profile_processes(profile_dir):
+        log(f"WARNING: Chrome is still running on {profile_dir}; "
+            f"it holds a live Google session. PIDs: {profile_pids(profile_dir)}")
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- encrypted profile
+
+def read_passphrase(from_stdin):
+    """Bytes, from a pipe or from the terminal.
+
+    Note the honest limit: CPython cannot reliably scrub a str, so the prompted
+    path leaves a copy in the heap until GC. Piping it in (--passphrase-stdin)
+    keeps it in a bytearray we can zero, and keeps it out of shell history."""
+    if from_stdin:
+        buf = bytearray(sys.stdin.buffer.readline())
+    else:
+        buf = bytearray(getpass.getpass("Profile image passphrase: ").encode())
+    while buf and buf[-1] in b"\r\n":
+        buf.pop()
+    if not buf:
+        sys.exit("Empty passphrase.")
+    return buf
 
 
 # --------------------------------------------------------------------------- gmail session
@@ -313,6 +400,31 @@ def confirm(context, link, address):
 
 # --------------------------------------------------------------------------- main
 
+def wait_for_enter(prompt, timeout_s=300):
+    """A pause a human may never come back to. Unbounded input() here once left a
+    signed-in Chrome up for two days; anything holding a live Google session has
+    to have a deadline."""
+    if not sys.stdin.isatty():
+        log("Not a terminal, so not pausing; closing the browser.")
+        return
+    print(prompt, end="", flush=True)
+    if select.select([sys.stdin], [], [], timeout_s)[0]:
+        sys.stdin.readline()
+    else:
+        print()
+        log(f"No input after {timeout_s}s; closing the browser anyway.")
+
+
+def install_signal_handlers():
+    """Turn the signals that end a remote session into a normal unwind, so the
+    finally: blocks below still close the browser and unmount the volume.
+    SIGHUP is the one that matters: it is what a dropped SSH connection sends."""
+    def bail(signum, _frame):
+        sys.exit(f"Received signal {signum}; shutting down.")
+    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, bail)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("address", help="the new send-as address, e.g. alias@example.com")
@@ -336,9 +448,21 @@ def main():
                     help="find the confirmation email in this inbox and click it "
                          "(default: on; --no-auto-verify to skip)")
     ap.add_argument("--browser", help="path to a Chrome executable")
-    ap.add_argument("--profile-dir", default=os.path.expanduser("~/.gmail-send-as-profile"))
-    ap.add_argument("--port", type=int, default=9333)
+    ap.add_argument("--profile-dir", default=os.path.expanduser("~/.gmail-send-as-profile"),
+                    help="unencrypted profile location (ignored with --profile-image)")
+    ap.add_argument("--profile-image", default=None,
+                    help="encrypted sparsebundle holding the profile; mounted for "
+                         "the run and detached afterwards. See make-profile-image.sh")
+    ap.add_argument("--mountpoint", default="/Volumes/gmail-send-as",
+                    help="where --profile-image is attached")
+    ap.add_argument("--passphrase-stdin", action="store_true",
+                    help="read the image passphrase from stdin instead of prompting, "
+                         "so it stays out of shell history and the terminal")
+    ap.add_argument("--port", type=int, default=0,
+                    help="DevTools port; 0 (the default) asks Chrome for a random "
+                         "one, since the port is unauthenticated while it is open")
     args = ap.parse_args()
+    install_signal_handlers()
 
     # Guard against pointing at the wrong signed-in account unless told otherwise.
     if args.expect_account is None:
@@ -355,36 +479,81 @@ def main():
     else:
         args.smtp_password = os.environ.get("SMTP_PASSWORD") or getpass.getpass("SMTP password: ")
 
-    proc = launch_browser(find_browser(args.browser), args.profile_dir, args.port)
-    browser = None
+    # With --profile-image the profile lives inside an encrypted volume that is
+    # ciphertext at rest. An already-mounted volume is left alone and, crucially,
+    # left mounted: something else put it there and owns detaching it.
+    mounted_here = False
+    if args.profile_image:
+        if is_mounted(args.mountpoint):
+            # Something else put it there - a broker, or you by hand - so it
+            # owns detaching it. We use it and leave it alone.
+            log(f"{args.mountpoint} is already mounted; using it as is.")
+        else:
+            passphrase = read_passphrase(args.passphrase_stdin)
+            try:
+                # The bytearray goes in as-is; bytes() would make an immutable
+                # copy we could not scrub afterwards.
+                mount(args.profile_image, args.mountpoint, passphrase)
+            except MountError as e:
+                sys.exit(f"Could not mount {args.profile_image}: {e}")
+            finally:
+                for i in range(len(passphrase)):
+                    passphrase[i] = 0
+            mounted_here = True
+            log(f"Mounted {args.profile_image} at {args.mountpoint}.")
+        args.profile_dir = os.path.join(args.mountpoint, "profile")
+
+    proc = None
+    port = None
+    stopped = None       # stop_browser's verdict, once it has run
     try:
+        proc, port = launch_browser(find_browser(args.browser), args.profile_dir,
+                                    args.port)
         with sync_playwright() as pw:
-            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{args.port}")
-            context = browser.contexts[0]
-            page = context.pages[0] if context.pages else context.new_page()
+            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            try:
+                context = browser.contexts[0]
+                page = context.pages[0] if context.pages else context.new_page()
 
-            page = ensure_signed_in(page, args.account_index, args.expect_account)
-            if not args.verify_only:
-                ik, at = get_session_tokens(page, context)
-                add_send_as(context, args, ik, at)
+                page = ensure_signed_in(page, args.account_index, args.expect_account)
+                if not args.verify_only:
+                    ik, at = get_session_tokens(page, context)
+                    add_send_as(context, args, ik, at)
 
-            if args.auto_verify:
-                link = find_confirmation_link(context, args)
-                if not link:
-                    log("No confirmation email arrived. Click the link manually when it does.")
-                else:
-                    ok, p = confirm(context, link, args.address)
-                    if ok:
-                        log(f"Confirmed: {args.address} is ready to use.")
+                if args.auto_verify:
+                    link = find_confirmation_link(context, args)
+                    if not link:
+                        log("No confirmation email arrived. Click the link manually when it does.")
                     else:
-                        log("Opened the confirmation page but couldn't confirm success; "
-                            "check the browser window.")
-                        input("Press Enter to close the browser...")
-            else:
-                log("Click the link in the confirmation email to finish.")
+                        ok, p = confirm(context, link, args.address)
+                        if ok:
+                            log(f"Confirmed: {args.address} is ready to use.")
+                        else:
+                            log("Opened the confirmation page but couldn't confirm success; "
+                                "check the browser window.")
+                            wait_for_enter("Press Enter to close the browser...")
+                else:
+                    log("Click the link in the confirmation email to finish.")
+            finally:
+                # Shut down while the CDP connection is still alive. Once this
+                # `with` exits, playwright has stopped and Browser.close can no
+                # longer be sent - which is how, for a long time, it never was:
+                # every run fell through to waiting out the DevTools port, then
+                # to a pkill that matched nothing, and Chrome stayed up.
+                stopped = stop_browser(browser, proc, args.profile_dir, port)
     finally:
-        # The signed-in profile stays on disk for the next run.
-        stop_browser(browser, proc, args.profile_dir, args.port)
+        if stopped is None:  # failed before playwright connected; nothing to close gracefully
+            stopped = stop_browser(None, proc, args.profile_dir, port)
+        # The signed-in profile stays on disk for the next run - as ciphertext,
+        # once the volume below is detached.
+        if mounted_here:
+            if not stopped:
+                log("Not detaching the volume while Chrome still holds it open.")
+            elif detach(args.mountpoint):
+                log(f"Detached {args.mountpoint}; the profile is encrypted at rest again.")
+            else:
+                log(f"WARNING: could not detach {args.mountpoint}. The profile is "
+                    f"readable until you run: hdiutil detach {args.mountpoint}")
 
 
 if __name__ == "__main__":

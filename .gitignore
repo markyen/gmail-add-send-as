@@ -8,3 +8,6 @@ __pycache__/
 
 # Local configuration.
 add-send-as.sh
+
+# Encrypted profile volumes, if anyone creates one inside the repo.
+*.sparsebundle

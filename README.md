@@ -74,6 +74,9 @@ Useful flags (`--help` lists them all):
 | `--reply-to` | Reply-To for the new address |
 | `--account-index N` | The `N` in `mail.google.com/mail/u/N/`, for multiple signed-in accounts |
 | `--browser` | Path to a Chrome executable |
+| `--profile-image` | Encrypted sparsebundle holding the profile (see below) |
+| `--passphrase-stdin` | Read the image passphrase from stdin rather than prompting |
+| `--port` | DevTools port; `0` (default) picks a random one |
 
 ## Signing in
 
@@ -82,7 +85,109 @@ The script starts your browser as a normal, non-automated instance with a
 over the DevTools protocol. The first run stops and waits while you sign in by
 hand, 2-step verification included; later runs reuse that session.
 
-Keep the profile folder private — it holds a live Google session.
+That session is the most dangerous thing this repo touches, so it gets its own
+section below.
+
+## Keeping the saved session contained
+
+A Google session cookie **cannot be scoped**. There is no Gmail-only cookie:
+`__Secure-1PSID` and friends authenticate you to Drive, Photos, Takeout and
+account settings alike, so the profile folder is, by construction, full access
+to the account. Nor is there a narrower credential to switch to — the Gmail API
+*does* have `users.settings.sendAs.create`, but it is
+[restricted to service accounts with domain-wide delegation](https://developers.google.com/workspace/gmail/api/v1/reference/users/settings/sendAs/create),
+which a personal account cannot have. Driving the HTML form is the only way in,
+and a full session is the price.
+
+Since the permission cannot be narrowed, the exposure is narrowed instead.
+
+**Encrypt the profile at rest.** `make-profile-image.sh` creates an encrypted
+sparsebundle; the script mounts it for the run and detaches it afterwards:
+
+```sh
+./make-profile-image.sh                 # once
+PROFILE_IMAGE=~/gmail-send-as.sparsebundle ./add-send-as.sh alias@example.com
+```
+
+At rest that leaves ciphertext and no running browser. The passphrase **must
+come from somewhere this machine is not** — your phone's password manager, or
+piped in over SSH. Keeping it in `pass` on the same disk as the image is a lock
+with the key taped to the door.
+
+```sh
+pass show sendas/profile | ssh mac workspace/gmail-add-send-as/add-send-as.sh alias@example.com
+```
+
+Encrypting at rest beats signing out between runs, at least if you work
+remotely: Google's risk engine treats every fresh profile as a new device, so
+repeated sign-outs buy escalating device-verification challenges precisely when
+you are on a phone and least able to answer them.
+
+**The DevTools port is unauthenticated.** While it is open, anything that can
+open a local socket can drive the signed-in browser through it. It now defaults
+to a random port (`--port 0`, read back from `DevToolsActivePort`) rather than a
+number published in `--help`. That shrinks the window; it does not close it, so
+runs should be as short as they can be.
+
+**Teardown is not optional.** Chrome left running is a live session plus an open
+port. `stop_browser` tries `Browser.close` first (which flushes the cookie
+store), then confirms with `pgrep` that nothing survived, escalating to
+`SIGTERM` and `SIGKILL`. `SIGHUP`, `SIGTERM` and `SIGINT` unwind through the
+same path, so a dropped SSH connection cleans up instead of orphaning the
+browser. If a previous run did leave one behind, the next run says so and
+adopts or clears it rather than silently attaching to it.
+
+**Revoking is not deleting.** Removing the profile folder invalidates nothing:
+the session stays live on Google's side, and any copy of the cookies taken
+beforehand still works. Sign out in the browser, or use
+[Your devices](https://myaccount.google.com/device-activity), to actually kill it.
+
+### Unlocking it remotely: run it under a broker
+
+If the passphrase lives on your phone and you work over SSH, something has to
+carry it to the Mac without it passing through your terminal — and in
+particular without it passing through an agent, where it would land in a
+transcript on this same disk and stay there.
+
+That is a broker's job, not this script's. An agent does not need the
+passphrase; it needs the volume mounted, and those are different grants. A
+broker takes a request with a justification, lets you approve it from your
+phone by entering the passphrase over your tailnet, mounts the volume, hands
+back the profile directory, and detaches the volume on its own timer. The
+passphrase travels phone → broker and never through the agent; what the agent
+holds afterwards (a grant id, a path) is worthless once the grant ends, so there
+is nothing to rotate.
+
+The script needs nothing special to run that way:
+
+```sh
+profile_dir=$(my-broker request …)    # blocks until you approve on your phone
+python3 gmail_add_send_as.py --profile-dir "$profile_dir" … alias@example.com
+my-broker release …
+```
+
+- `--profile-dir` points at the mounted profile. The script never mounts or
+  detaches it, so the broker's timer stays the one in charge.
+- Teardown stops Chrome on the profile before the script exits, so the broker
+  can detach as soon as the grant is released.
+- Ending a grant that outlives the run is the broker's job, not the script's:
+  the consumer is exactly the thing that crashes before cleaning up.
+
+**The limit, stated plainly:** while the volume is mounted, anything running as
+your user can read it. That is unavoidable — the point is to let a program use
+the profile. A broker protects the long-lived secret, and so every future
+session, even if a transcript leaks in full. It does not protect the current
+session from a process that is already hostile. Keep grants short.
+
+**No broker, same property:** mount the image from a second SSH session and pass
+`--profile-image`; the script uses an existing mount and leaves it mounted. That
+has to be a genuinely separate session, not Claude Code's `!` prefix, whose
+output is captured into the transcript.
+
+**The app password is the other unscopable credential.** It is full IMAP/SMTP
+access and bypasses 2FA, so the same logic applies — generate it when you need
+it, revoke it at [App passwords](https://myaccount.google.com/apppasswords)
+afterwards.
 
 Two details make the saved session survive on macOS, both handled automatically:
 
@@ -103,3 +208,7 @@ Two details make the saved session survive on macOS, both handled automatically:
 - Personal Gmail accounts only. Google Workspace admins can do this centrally.
 - Nothing is stored except the browser profile. The SMTP password is passed through
   the environment and never written to disk.
+- The profile is only encrypted while Chrome is not running. Anything with code
+  execution as your user, during a run, can read the mounted volume. This
+  defends against a stolen disk, a backup sweep and a cold profile folder — not
+  against a compromised machine while the work is happening.
