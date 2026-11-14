@@ -82,8 +82,15 @@ Useful flags (`--help` lists them all):
 
 The script starts your browser as a normal, non-automated instance with a
 **dedicated profile folder** (`~/.gmail-send-as-profile` by default) and attaches
-over the DevTools protocol. The first run stops and waits while you sign in by
-hand, 2-step verification included; later runs reuse that session.
+over the DevTools protocol.
+
+Google's sign-in page refuses a browser that DevTools is driving, with "This
+browser or app may not be secure". So when the profile has no session, the script
+closes that browser and opens the same profile in a plain Chrome window, with no
+DevTools port and nothing attached. Sign in there by hand, 2-step verification
+included, then **quit Chrome with Cmd-Q** (closing the window leaves Chrome
+running). The script waits up to 8 minutes for Chrome to quit, then attaches
+again and carries on. Later runs reuse the session.
 
 That session is the most dangerous thing this repo touches, so it gets its own
 section below.

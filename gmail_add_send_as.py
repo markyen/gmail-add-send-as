@@ -17,9 +17,13 @@ field names, so hidden fields (at, cfrp, ...) are always correct.
 
 Authentication: the script launches Chrome as a normal, non-automated
 browser with a DEDICATED profile folder and attaches over the DevTools protocol.
-The first run, you sign in by hand (incl. 2-step verification); later runs reuse
-that session. Running over SSH works too; see launch_browser() for the macOS
-keychain detail that makes the saved session survive.
+Google's sign-in page refuses a browser that DevTools is driving ("This browser
+or app may not be secure"), so when the profile has no session the script closes
+that browser and opens the profile in a plain Chrome with no DevTools port. You
+sign in there by hand (incl. 2-step verification) and quit it with Cmd-Q; the
+script then attaches again. Later runs reuse the session. Running over SSH works
+too; see start_chrome() for the macOS keychain detail that makes the saved
+session survive.
 
 That saved session is the sharp edge here. A Google cookie cannot be scoped -
 there is no Gmail-only session, so the profile is full access to the account,
@@ -126,6 +130,55 @@ def devtools_port(profile_dir, deadline):
     return None
 
 
+def start_chrome(exe, flags):
+    """Start Chrome with these flags. Returns the child process, or None when
+    macOS launched it for us."""
+    bundle = macos_app_bundle(exe) if platform.system() == "Darwin" else None
+    if bundle and not has_gui_session():
+        # Over SSH (or from any shell outside the GUI login session) a directly
+        # spawned Chrome has no macOS security session, so it cannot fetch the
+        # cookie-encryption key from the keychain: the lookup fails with
+        # errSecInteractionNotAllowed (-25308) because the keychain is not allowed
+        # to prompt, Chrome reports "Encryption is not available", and it then
+        # keeps cookies in memory only. The browser window still appears and you
+        # can sign in, but nothing is saved and every run asks you to sign in
+        # again. Handing the launch to LaunchServices instead starts Chrome inside
+        # the console user's GUI session, where the key is available as usual.
+        subprocess.run(["open", "-na", bundle, "--args"] + flags, check=True)
+        return None
+    return subprocess.Popen([exe] + flags,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def sign_in_plain(exe, profile_dir, account_index, timeout_s=8 * 60):
+    """Open the profile in a plain Chrome - no DevTools port, nothing attached -
+    and wait for you to sign in and quit it. Google's sign-in page refuses a
+    browser under DevTools control, and quitting is what flushes the new session
+    to disk and hands the profile back. Exits, after closing Chrome, if it is
+    still open at the deadline; the broker's grant (15-20 minutes) has to cover
+    this wait and the run after it."""
+    proc = start_chrome(exe, [f"--user-data-dir={profile_dir}", "--no-first-run",
+                              "--no-default-browser-check",
+                              f"{MAIL}/mail/u/{account_index}/"])
+    started = time.time() + 30
+    while not profile_pids(profile_dir):
+        if time.time() > started:
+            sys.exit("Chrome did not start for the sign-in.")
+        time.sleep(0.5)
+
+    log("Not signed in. Sign in to Gmail in the Chrome window that just opened, "
+        "then quit Chrome with Cmd-Q (closing the window is not enough).")
+    log(f"The run continues once Chrome has quit; it gives up after {timeout_s // 60} minutes.")
+    deadline = time.time() + timeout_s
+    while profile_pids(profile_dir):
+        if proc is not None:
+            proc.poll()                      # reap it, so it leaves the process table
+        if time.time() > deadline:
+            end_profile_processes(profile_dir)
+            sys.exit("Timed out waiting for Chrome to quit after the sign-in.")
+        time.sleep(1)
+
+
 def launch_browser(exe, profile_dir, port):
     """Start the browser and wait for its DevTools port. Returns (proc, port).
     proc is None when macOS launched it for us (see below), or when we adopted an
@@ -155,25 +208,9 @@ def launch_browser(exe, profile_dir, port):
     except OSError:
         pass
 
-    flags = [f"--remote-debugging-port={port}", f"--user-data-dir={profile_dir}",
-             "--no-first-run", "--no-default-browser-check", "about:blank"]
-
-    bundle = macos_app_bundle(exe) if platform.system() == "Darwin" else None
-    proc = None
-    if bundle and not has_gui_session():
-        # Over SSH (or from any shell outside the GUI login session) a directly
-        # spawned Chrome has no macOS security session, so it cannot fetch the
-        # cookie-encryption key from the keychain: the lookup fails with
-        # errSecInteractionNotAllowed (-25308) because the keychain is not allowed
-        # to prompt, Chrome reports "Encryption is not available", and it then
-        # keeps cookies in memory only. The browser window still appears and you
-        # can sign in, but nothing is saved and every run asks you to sign in
-        # again. Handing the launch to LaunchServices instead starts Chrome inside
-        # the console user's GUI session, where the key is available as usual.
-        subprocess.run(["open", "-na", bundle, "--args"] + flags, check=True)
-    else:
-        proc = subprocess.Popen([exe] + flags,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = start_chrome(exe, [f"--remote-debugging-port={port}",
+                              f"--user-data-dir={profile_dir}", "--no-first-run",
+                              "--no-default-browser-check", "about:blank"])
 
     bound = devtools_port(profile_dir, time.time() + 30)
     if bound is None:
@@ -238,34 +275,14 @@ def read_passphrase(from_stdin):
 
 # --------------------------------------------------------------------------- gmail session
 
-def ensure_signed_in(page, account_index, expect_account):
-    """Make sure we are looking at the inbox, prompting for a manual sign-in if
-    needed. Returns the page showing the inbox, which is NOT necessarily the one
-    passed in: Google's sign-in flow often finishes in a tab of its own and
-    leaves the original one on a marketing or account-chooser page."""
-    context = page.context
+def open_inbox(page, account_index, expect_account):
+    """Open the inbox. Returns the page showing it, or None when the profile is
+    not signed in. Signing in is not done here: Google refuses it in a browser
+    under DevTools control, so main() closes this one and calls sign_in_plain()."""
     inbox_re = re.compile(rf"https://mail\.google\.com/mail/u/{account_index}/")
     page.goto(f"{MAIL}/mail/u/{account_index}/")
-
     if not inbox_re.match(page.url):
-        # There may well be other Chrome windows open; raise ours so it is obvious
-        # which one to type into. Closing the wrong one kills this run.
-        try:
-            page.bring_to_front()
-        except Exception:
-            pass
-        log("Not signed in. Sign in to Gmail in the browser window that just came to "
-            "the front (title: 'Sign in - Google Accounts').")
-        log("Leave that window open until this script finishes.")
-        deadline = time.time() + 10 * 60
-        while True:
-            signed_in = next((p for p in context.pages if inbox_re.match(p.url)), None)
-            if signed_in:
-                page = signed_in
-                break
-            if time.time() > deadline:
-                sys.exit("Timed out waiting for the sign-in to finish.")
-            time.sleep(1)
+        return None
 
     page.wait_for_load_state("domcontentloaded")
     # The title looks like "Inbox (3) - someone@gmail.com - Gmail".
@@ -425,6 +442,49 @@ def install_signal_handlers():
         signal.signal(sig, bail)
 
 
+def attached_run(exe, args, state):
+    """Launch Chrome with DevTools, attach, and do the work. Returns False, having
+    done nothing, when the profile is not signed in. Records the browser in
+    `state` so main() can still close it if this raises."""
+    state["proc"], state["port"] = launch_browser(exe, args.profile_dir, args.port)
+    with sync_playwright() as pw:
+        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{state['port']}")
+        try:
+            context = browser.contexts[0]
+            page = context.pages[0] if context.pages else context.new_page()
+
+            page = open_inbox(page, args.account_index, args.expect_account)
+            if page is None:
+                return False
+            if not args.verify_only:
+                ik, at = get_session_tokens(page, context)
+                add_send_as(context, args, ik, at)
+
+            if args.auto_verify:
+                link = find_confirmation_link(context, args)
+                if not link:
+                    log("No confirmation email arrived. Click the link manually when it does.")
+                else:
+                    ok, p = confirm(context, link, args.address)
+                    if ok:
+                        log(f"Confirmed: {args.address} is ready to use.")
+                    else:
+                        log("Opened the confirmation page but couldn't confirm success; "
+                            "check the browser window.")
+                        wait_for_enter("Press Enter to close the browser...")
+            else:
+                log("Click the link in the confirmation email to finish.")
+            return True
+        finally:
+            # Shut down while the CDP connection is still alive. Once this
+            # `with` exits, playwright has stopped and Browser.close can no
+            # longer be sent - which is how, for a long time, it never was:
+            # every run fell through to waiting out the DevTools port, then
+            # to a pkill that matched nothing, and Chrome stayed up.
+            state["stopped"] = stop_browser(browser, state["proc"], args.profile_dir,
+                                            state["port"])
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("address", help="the new send-as address, e.g. alias@example.com")
@@ -503,47 +563,22 @@ def main():
             log(f"Mounted {args.profile_image} at {args.mountpoint}.")
         args.profile_dir = os.path.join(args.mountpoint, "profile")
 
-    proc = None
-    port = None
-    stopped = None       # stop_browser's verdict, once it has run
+    exe = find_browser(args.browser)
+    # The browser now on the profile: its child process, DevTools port, and
+    # stop_browser's verdict once it has run (None while one may still be up)
+    state = {"proc": None, "port": None, "stopped": None}
     try:
-        proc, port = launch_browser(find_browser(args.browser), args.profile_dir,
-                                    args.port)
-        with sync_playwright() as pw:
-            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-            try:
-                context = browser.contexts[0]
-                page = context.pages[0] if context.pages else context.new_page()
-
-                page = ensure_signed_in(page, args.account_index, args.expect_account)
-                if not args.verify_only:
-                    ik, at = get_session_tokens(page, context)
-                    add_send_as(context, args, ik, at)
-
-                if args.auto_verify:
-                    link = find_confirmation_link(context, args)
-                    if not link:
-                        log("No confirmation email arrived. Click the link manually when it does.")
-                    else:
-                        ok, p = confirm(context, link, args.address)
-                        if ok:
-                            log(f"Confirmed: {args.address} is ready to use.")
-                        else:
-                            log("Opened the confirmation page but couldn't confirm success; "
-                                "check the browser window.")
-                            wait_for_enter("Press Enter to close the browser...")
-                else:
-                    log("Click the link in the confirmation email to finish.")
-            finally:
-                # Shut down while the CDP connection is still alive. Once this
-                # `with` exits, playwright has stopped and Browser.close can no
-                # longer be sent - which is how, for a long time, it never was:
-                # every run fell through to waiting out the DevTools port, then
-                # to a pkill that matched nothing, and Chrome stayed up.
-                stopped = stop_browser(browser, proc, args.profile_dir, port)
+        if not attached_run(exe, args, state):
+            if not state["stopped"]:
+                sys.exit("Chrome is still running on the profile; not opening another to sign in.")
+            state.update(proc=None, port=None, stopped=None)
+            sign_in_plain(exe, args.profile_dir, args.account_index)
+            if not attached_run(exe, args, state):
+                sys.exit("Still not signed in after the sign-in window was closed.")
     finally:
-        if stopped is None:  # failed before playwright connected; nothing to close gracefully
-            stopped = stop_browser(None, proc, args.profile_dir, port)
+        if state["stopped"] is None:  # nothing closed it gracefully
+            state["stopped"] = stop_browser(None, state["proc"], args.profile_dir, state["port"])
+        stopped = state["stopped"]
         # The signed-in profile stays on disk for the next run - as ciphertext,
         # once the volume below is detached.
         if mounted_here:
